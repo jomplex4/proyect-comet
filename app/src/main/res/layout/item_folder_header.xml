@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="52dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="18dp"
+    android:paddingEnd="8dp">
+
+    <TextView
+        android:id="@+id/headerText"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:fontFamily="@font/space_grotesk_medium"
+        android:letterSpacing="0.08"
+        android:textColor="@color/muted"
+        android:textSize="12.5sp" />
+
+    <ImageButton
+        android:id="@+id/btnSort"
+        style="@style/IconButton"
+        android:contentDescription="Sort"
+        android:src="@drawable/ic_sort" />
+</LinearLayout>

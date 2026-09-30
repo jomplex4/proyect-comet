@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#000000</color>
+    <color name="graphite_0">#0D0D0E</color>
+    <color name="graphite_1">#151517</color>
+    <color name="graphite_2">#1F2023</color>
+    <color name="graphite_3">#2C2D31</color>
+    <color name="line">#34353A</color>
+    <color name="white">#FFFFFF</color>
+    <color name="muted">#9A9CA4</color>
+    <color name="red">#DC0000</color>
+    <color name="red_hot">#FF2A1F</color>
+    <color name="scrim_top">#B3000000</color>
+    <color name="chip_bg">#8C1F2023</color>
+    <color name="panel_bg">#F2151517</color>
+    <color name="ic_launcher_background">#BEBEBE</color>
+</resources>

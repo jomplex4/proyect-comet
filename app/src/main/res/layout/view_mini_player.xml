@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="64dp"
+    android:layout_marginStart="10dp"
+    android:layout_marginEnd="10dp"
+    android:layout_marginBottom="8dp"
+    android:background="@drawable/bg_mini"
+    android:visibility="gone">
+
+    <LinearLayout
+        android:id="@+id/miniOpen"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="?attr/selectableItemBackground"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="10dp"
+        android:paddingEnd="4dp">
+
+        <FrameLayout
+            android:id="@+id/miniThumbBox"
+            android:layout_width="72dp"
+            android:layout_height="42dp"
+            android:background="@drawable/bg_thumb_small">
+
+            <ImageView
+                android:id="@+id/miniThumb"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:contentDescription="@null"
+                android:scaleType="centerCrop" />
+        </FrameLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/miniTitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:fontFamily="@font/space_grotesk_medium"
+                android:maxLines="1"
+                android:textColor="@color/white"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/miniSubtitle"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="@color/muted"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <ImageButton
+            android:id="@+id/miniPlay"
+            android:layout_width="42dp"
+            android:layout_height="42dp"
+            android:background="@drawable/circle_ripple"
+            android:contentDescription="Play or pause"
+            android:padding="9dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_pause" />
+
+        <ImageButton
+            android:id="@+id/miniNext"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:background="@drawable/circle_ripple"
+            android:contentDescription="Next"
+            android:padding="9dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_next" />
+
+        <ImageButton
+            android:id="@+id/miniQueue"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:background="@drawable/circle_ripple"
+            android:contentDescription="Queue"
+            android:padding="9dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_queue" />
+
+        <ImageButton
+            android:id="@+id/miniClose"
+            android:layout_width="38dp"
+            android:layout_height="38dp"
+            android:alpha="0.7"
+            android:background="@drawable/circle_ripple"
+            android:contentDescription="Stop"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_close" />
+    </LinearLayout>
+
+    <ProgressBar
+        android:id="@+id/miniProgress"
+        style="?android:attr/progressBarStyleHorizontal"
+        android:layout_width="match_parent"
+        android:layout_height="2dp"
+        android:layout_gravity="bottom"
+        android:layout_marginStart="14dp"
+        android:layout_marginEnd="14dp"
+        android:max="1000"
+        android:progressDrawable="@drawable/thumb_progress" />
+</FrameLayout>
