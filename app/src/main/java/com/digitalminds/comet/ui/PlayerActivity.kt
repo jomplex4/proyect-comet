@@ -15,6 +15,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.view.GestureDetector
@@ -84,9 +85,11 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
     private var dragging = false
     private var closing = false
 
-    // Swipe gestures: 1 = brightness (left half), 2 = volume (right half).
+    // Swipe gestures: 1 = brightness (left half), 2 = volume (right half), 3 = seek (sideways).
     private var swipeMode = 0
     private var swipeStart = 0f
+    private var seekDragStart = 0L
+    private var seekDragTarget = 0L
 
     private val speeds = floatArrayOf(0.25f, 0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f)
 
@@ -113,22 +116,31 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
             Launch.pending = null
             if (request != null) {
                 svc.playQueue(request.first, request.second)
+                attach(svc.player)
             } else if (svc.player.mediaItemCount == 0) {
-                finish()
-                return
-            } else if (svc.isAudioNow()) {
-                // A song is loaded: it belongs in the music player.
-                startActivity(Intent(this@PlayerActivity, MusicPlayerActivity::class.java))
-                finish()
-                return
+                // Android closed the app while it was paused: put everything back where it was.
+                svc.restoreLast { ok ->
+                    if (!ok || isDestroyed) finish() else proceed(svc)
+                }
+            } else {
+                proceed(svc)
             }
-            attach(svc.player)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             detach()
             service = null
         }
+    }
+
+    /** The service has something loaded: show it here, or hand it to the music player. */
+    private fun proceed(svc: PlaybackService) {
+        if (svc.isAudioNow()) {
+            startActivity(Intent(this, MusicPlayerActivity::class.java))
+            finish()
+            return
+        }
+        attach(svc.player)
     }
 
     private val listener = object : Player.Listener {
@@ -226,6 +238,12 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
         player?.let {
             setVideoEnabled(it, true)
             it.setVideoSurfaceView(b.surface)
+            // Something may have changed while we were away (paused from the notification):
+            // show the real state right now.
+            updatePlayButton()
+            updateTitle()
+            updateProgress()
+            b.root.keepScreenOn = it.isPlaying
         }
         handler.post(ticker)
     }
@@ -273,6 +291,13 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
 
     override fun onPlayerReplaced(newPlayer: ExoPlayer) {
         attach(newPlayer)
+    }
+
+    override fun onServiceGone() {
+        // The service ended (for example, a long pause was released): nothing left to control.
+        detach()
+        service = null
+        if (!isFinishing) finish()
     }
 
     // ================================================================ player wiring
@@ -487,21 +512,30 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
         })
     }
 
-    private fun togglePlay(p: Player) {
-        if (p.isPlaying) {
-            p.pause()
+    private fun togglePlay(@Suppress("UNUSED_PARAMETER") p: Player) {
+        val svc = service
+        if (svc != null) {
+            svc.togglePlay()
         } else {
-            if (p.playbackState == Player.STATE_ENDED) p.seekToDefaultPosition(p.currentMediaItemIndex)
-            if (p.playbackState == Player.STATE_IDLE) p.prepare()
-            p.play()
+            val pl = player ?: return
+            if (PlaybackService.isActive(pl)) pl.pause() else pl.play()
         }
     }
+
+    // Rapid taps add up: 3 taps show 30s, 51 taps show 510s.
+    private var seekAccumMs = 0L
+    private var seekAccumAt = 0L
 
     private fun seekBy(deltaMs: Long) {
         val p = player ?: return
         val dur = p.duration.takeIf { it != C.TIME_UNSET } ?: Long.MAX_VALUE
         p.seekTo((p.currentPosition + deltaMs).coerceIn(0, dur))
-        showHud(if (deltaMs < 0) "-10s" else "+10s")
+        val now = SystemClock.elapsedRealtime()
+        val sameRun = now - seekAccumAt < 1200 && seekAccumMs != 0L && (seekAccumMs < 0) == (deltaMs < 0)
+        seekAccumMs = if (sameRun) seekAccumMs + deltaMs else deltaMs
+        seekAccumAt = now
+        val secs = Math.abs(seekAccumMs) / 1000
+        showHud((if (seekAccumMs < 0) "-" else "+") + secs + "s")
         scheduleHide()
     }
 
@@ -561,7 +595,7 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
 
     private fun updatePlayButton() {
         val p = player ?: return
-        b.btnPlay.setImageResource(if (p.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
+        b.btnPlay.setImageResource(if (PlaybackService.isActive(p)) R.drawable.ic_pause else R.drawable.ic_play)
     }
 
     private fun updateProgress() {
@@ -691,7 +725,7 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
                     e.x > w * 0.65f -> seekBy(10_000)
                     else -> {
                         togglePlay(p)
-                        showHud(if (p.playWhenReady) "Play" else "Pause")
+                        showHud(if (PlaybackService.isActive(p)) "Play" else "Pause")
                     }
                 }
                 return true
@@ -700,15 +734,36 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
             override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
                 if (locked || e1 == null) return false
                 val h = b.gestureLayer.height.toFloat().coerceAtLeast(1f)
+                val w = b.gestureLayer.width.toFloat().coerceAtLeast(1f)
                 if (swipeMode == 0) {
                     val dx = abs(e2.x - e1.x)
                     val dy = abs(e2.y - e1.y)
-                    // Ignore the very top and bottom edges: those belong to the system gestures.
-                    if (e1.y < 48 * dp || e1.y > h - 48 * dp) return false
-                    if (dy < 12 * dp || dy < dx) return false
-                    swipeMode = if (e1.x < b.gestureLayer.width / 2f) 1 else 2
-                    swipeStart = if (swipeMode == 1) currentBrightness()
-                    else audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat()
+                    if (dx > 16 * dp && dx > dy * 1.2f) {
+                        // Pulling sideways anywhere on the screen: go back or forward in the video.
+                        val p = player ?: return false
+                        swipeMode = 3
+                        seekDragStart = p.currentPosition
+                        seekDragTarget = seekDragStart
+                    } else {
+                        // Up and down: brightness (left half) and volume (right half). The very top
+                        // and bottom edges belong to the system gestures.
+                        if (e1.y < 48 * dp || e1.y > h - 48 * dp) return false
+                        if (dy < 12 * dp || dy < dx) return false
+                        swipeMode = if (e1.x < w / 2f) 1 else 2
+                        swipeStart = if (swipeMode == 1) currentBrightness()
+                        else audio.getStreamVolume(AudioManager.STREAM_MUSIC).toFloat()
+                    }
+                }
+                if (swipeMode == 3) {
+                    val p = player ?: return true
+                    val dur = p.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: return true
+                    // A full screen width moves a quarter of the video, between 30 s and 10 min.
+                    val span = (dur / 4).coerceIn(30_000L, 600_000L).toFloat()
+                    val delta = ((e2.x - e1.x) / w * span).toLong()
+                    seekDragTarget = (seekDragStart + delta).coerceIn(0, dur)
+                    val diff = (seekDragTarget - seekDragStart) / 1000
+                    showHud((if (diff < 0) "-" else "+") + abs(diff) + "s   " + Format.duration(seekDragTarget))
+                    return true
                 }
                 val delta = (e1.y - e2.y) / (h * 0.75f)
                 if (swipeMode == 1) {
@@ -757,6 +812,10 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
                 if (twoFinger) endTwoFinger()
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (swipeMode == 3 && e.actionMasked == MotionEvent.ACTION_UP) {
+                    player?.seekTo(seekDragTarget)
+                    scheduleHide()
+                }
                 if (twoFinger) endTwoFinger()
                 if (!ignoreUntilUp) gestures.onTouchEvent(e)
                 swipeMode = 0

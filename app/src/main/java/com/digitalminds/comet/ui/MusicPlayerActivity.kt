@@ -83,22 +83,37 @@ class MusicPlayerActivity : AppCompatActivity(), PlaybackService.Host {
             Launch.pending = null
             if (request != null) {
                 svc.playQueue(request.first, request.second)
+                attach(svc.player)
             } else if (svc.player.mediaItemCount == 0) {
-                finish()
-                return
-            } else if (!svc.isAudioNow()) {
-                // A video is loaded: show it in the video player instead.
-                startActivity(Intent(this@MusicPlayerActivity, PlayerActivity::class.java))
-                finish()
-                return
+                // Android closed the app while it was paused: put everything back where it was.
+                svc.restoreLast { ok ->
+                    if (!ok || isDestroyed) finish() else proceed(svc)
+                }
+            } else {
+                proceed(svc)
             }
-            attach(svc.player)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             detach()
             service = null
         }
+    }
+
+    /** The service has something loaded: show it here, or hand it to the video player. */
+    private fun proceed(svc: PlaybackService) {
+        if (!svc.isAudioNow()) {
+            startActivity(Intent(this, PlayerActivity::class.java))
+            finish()
+            return
+        }
+        attach(svc.player)
+    }
+
+    override fun onServiceGone() {
+        detach()
+        service = null
+        if (!isFinishing) finish()
     }
 
     private val listener = object : Player.Listener {
@@ -156,6 +171,8 @@ class MusicPlayerActivity : AppCompatActivity(), PlaybackService.Host {
 
     override fun onStart() {
         super.onStart()
+        // Something may have changed while we were away (paused from the notification).
+        if (player != null) refresh()
         handler.post(ticker)
     }
 
@@ -231,7 +248,7 @@ class MusicPlayerActivity : AppCompatActivity(), PlaybackService.Host {
         val title = (item.mediaMetadata.title ?: md.title ?: "").toString()
         if (b.title.text.toString() != title) b.title.text = title
         b.artist.text = item.mediaMetadata.artist ?: md.artist ?: ""
-        b.btnPlay.setImageResource(if (p.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
+        b.btnPlay.setImageResource(if (PlaybackService.isActive(p)) R.drawable.ic_pause else R.drawable.ic_play)
         b.btnPrev.alpha = if (p.hasPreviousMediaItem()) 1f else 0.35f
         b.btnNext.alpha = if (p.hasNextMediaItem()) 1f else 0.35f
         val fav = Playlists.isFavorite(item.mediaId)
@@ -293,12 +310,8 @@ class MusicPlayerActivity : AppCompatActivity(), PlaybackService.Host {
     private fun setupButtons() {
         b.btnBack.setOnClickListener { finish() }
         b.btnPlay.setOnClickListener {
-            val p = player ?: return@setOnClickListener
-            if (p.isPlaying) p.pause() else {
-                if (p.playbackState == Player.STATE_ENDED) p.seekToDefaultPosition(p.currentMediaItemIndex)
-                if (p.playbackState == Player.STATE_IDLE) p.prepare()
-                p.play()
-            }
+            val svc = service
+            if (svc != null) svc.togglePlay() else player?.let { if (PlaybackService.isActive(it)) it.pause() else it.play() }
         }
         b.btnPrev.setOnClickListener { service?.previous() }
         b.btnNext.setOnClickListener { service?.next() }

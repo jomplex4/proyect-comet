@@ -107,6 +107,11 @@ object MediaRepo {
         return out
     }
 
+    fun byKeys(keys: List<String>): List<Video> {
+        val map = cache.associateBy { it.key }
+        return keys.mapNotNull { map[it] }
+    }
+
     fun sortVideos(list: List<Video>, prefs: Prefs): List<Video> {
         val sorted = when (prefs.sortKey) {
             Prefs.SORT_MODIFIED -> list.sortedBy { it.dateModified }

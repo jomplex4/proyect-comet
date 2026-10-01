@@ -80,14 +80,8 @@ class MiniPlayer(
         setupSwipe()
         b.miniPrev.setOnClickListener { service?.previous() }
         b.miniPlay.setOnClickListener {
-            val p = player ?: return@setOnClickListener
-            if (p.isPlaying) {
-                p.pause()
-            } else {
-                if (p.playbackState == Player.STATE_ENDED) p.seekToDefaultPosition(p.currentMediaItemIndex)
-                if (p.playbackState == Player.STATE_IDLE) p.prepare()
-                p.play()
-            }
+            val svc = service
+            if (svc != null) svc.togglePlay() else player?.let { if (PlaybackService.isActive(it)) it.pause() else it.play() }
         }
         b.miniNext.setOnClickListener { service?.next() }
     }
@@ -263,7 +257,7 @@ class MiniPlayer(
         b.root.visibility = View.VISIBLE
         val md = item.mediaMetadata
         b.miniTitle.text = md.title ?: ""
-        b.miniPlay.setImageResource(if (p.isPlaying) R.drawable.ic_pause else R.drawable.ic_play)
+        b.miniPlay.setImageResource(if (PlaybackService.isActive(p)) R.drawable.ic_pause else R.drawable.ic_play)
         b.miniNext.alpha = if (p.hasNextMediaItem()) 1f else 0.35f
         if (shownKey != item.mediaId) {
             shownKey = item.mediaId

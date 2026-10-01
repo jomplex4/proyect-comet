@@ -1,7 +1,9 @@
 package com.digitalminds.comet.service
 
 import android.app.PendingIntent
+import android.app.NotificationManager
 import android.app.Service
+import android.content.pm.ServiceInfo
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -12,6 +14,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.ServiceCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -31,10 +34,13 @@ import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
+import com.digitalminds.comet.data.AudioRepo
+import com.digitalminds.comet.data.MediaRepo
 import com.digitalminds.comet.data.isAudioItem
 import com.digitalminds.comet.ui.MusicPlayerActivity
 import com.digitalminds.comet.ui.PlayerActivity
 import com.digitalminds.comet.util.HistoryEntry
+import com.digitalminds.comet.util.LastSession
 import com.digitalminds.comet.util.PositionStore
 import com.digitalminds.comet.util.Prefs
 import com.digitalminds.comet.util.Thumbs
@@ -75,6 +81,13 @@ class PlaybackService : MediaSessionService() {
         const val TEN_MINUTES = 10 * 60 * 1000L
         private const val FADE_MS = 5000L
 
+        /** A paused player keeps its notification and its place for this long. */
+        private const val HOLD_MS = 60 * 60 * 1000L
+
+        /** What the play / pause button should show: playing, or about to (buffering). */
+        fun isActive(p: Player): Boolean =
+            p.playWhenReady && p.playbackState != Player.STATE_ENDED && p.playbackState != Player.STATE_IDLE
+
         /** What is loaded right now, for the "now playing" red row in lists. */
         @Volatile
         var nowPlayingKey: String? = null
@@ -105,6 +118,59 @@ class PlaybackService : MediaSessionService() {
 
     // Volume = mute switch x start ramp x sleep fade. Every change goes through applyVolume(),
     // so a fade-in, a fade-out and the mute button never fight each other.
+    // Paused but not forgotten: the service stays in the foreground so Android does not close it.
+    private var pausedSince = 0L
+    private val io = Executors.newSingleThreadExecutor()
+
+    private val holdTick = object : Runnable {
+        override fun run() {
+            if (player.mediaItemCount == 0 || player.playWhenReady || !wantsNotification()) {
+                pausedSince = 0L
+                return
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (pausedSince == 0L) pausedSince = now
+            if (now - pausedSince > HOLD_MS) {
+                // Long forgotten. If you are looking at the app we leave it; otherwise let go.
+                if (hosts.isEmpty()) stopAndClear()
+                return
+            }
+            promoteForeground()
+            handler.postDelayed(this, 30_000)
+        }
+    }
+
+    /** Re-attaches the paused notification to the foreground service (Media3 lets go when you pause). */
+    private fun promoteForeground() {
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            val posted = nm.activeNotifications.firstOrNull {
+                it.id == DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID
+            } ?: return
+            ServiceCompat.startForeground(
+                this, posted.id, posted.notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            )
+        } catch (e: Exception) {
+            // The system may refuse while the app is in the background; the next try will do it.
+        }
+    }
+
+    /** Called whenever the player pauses or its notification changes while paused. */
+    private fun holdWhilePaused() {
+        handler.removeCallbacks(holdTick)
+        if (player.mediaItemCount == 0 || player.playWhenReady) {
+            pausedSince = 0L
+            return
+        }
+        if (pausedSince == 0L) pausedSince = SystemClock.elapsedRealtime()
+        // Media3 updates the notification a moment after the pause (and again when the cover
+        // loads), so we re-attach a few times, then keep checking every 30 seconds.
+        handler.postDelayed({ if (!player.playWhenReady) promoteForeground() }, 400)
+        handler.postDelayed({ if (!player.playWhenReady) promoteForeground() }, 1500)
+        handler.postDelayed({ if (!player.playWhenReady) promoteForeground() }, 4000)
+        handler.postDelayed(holdTick, 30_000)
+    }
+
     private var userMuted = false
     private var rampFactor = 1f
     private var rampFrom = 1f
@@ -187,12 +253,14 @@ class PlaybackService : MediaSessionService() {
             lastDuration = 0
             nowPlayingKey = mediaItem?.mediaId
             updateSessionActivity(mediaItem)
+            if (mediaItem != null) LastSession.saveIndex(player.currentMediaItemIndex)
         }
 
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM && sleepEndOfItem) {
                 finishSleep()
             }
+            if (!playWhenReady) holdWhilePaused() else pausedSince = 0L
             // Coming back from pause: bring the sound up softly instead of cutting in.
             if (playWhenReady && !awaitingFirstFrame && sleepFactor == 1f) {
                 rampFactor = 0f
@@ -209,6 +277,20 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
+        override fun onTimelineChanged(timeline: androidx.media3.common.Timeline, reason: Int) {
+            if (player.mediaItemCount == 0) return
+            LastSession.saveQueue(
+                List(player.mediaItemCount) { player.getMediaItemAt(it).mediaId },
+                player.currentMediaItem?.isAudioItem() == true
+            )
+            LastSession.saveIndex(player.currentMediaItemIndex)
+        }
+
+        override fun onIsPlayingChanged(isPlaying: Boolean) {
+            if (!isPlaying) savePosition()
+            if (!isPlaying && !player.playWhenReady) holdWhilePaused()
+        }
+
         override fun onTrackSelectionParametersChanged(parameters: TrackSelectionParameters) {
             // Video turned off (Background Play) or back on: the notification may need to appear or go.
             refreshNotification()
@@ -222,9 +304,6 @@ class PlaybackService : MediaSessionService() {
             }
         }
 
-        override fun onIsPlayingChanged(isPlaying: Boolean) {
-            if (!isPlaying) savePosition()
-        }
     }
 
     override fun onCreate() {
@@ -260,6 +339,7 @@ class PlaybackService : MediaSessionService() {
     override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
         if (wantsNotification()) {
             super.onUpdateNotification(session, startInForegroundRequired)
+            if (!player.playWhenReady && player.mediaItemCount > 0) holdWhilePaused()
         } else {
             stopForeground(Service.STOP_FOREGROUND_REMOVE)
             NotificationManagerCompat.from(this).cancel(DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID)
@@ -288,15 +368,20 @@ class PlaybackService : MediaSessionService() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if (!player.playWhenReady || player.mediaItemCount == 0) {
-            savePosition()
+        savePosition()
+        if (player.mediaItemCount == 0) {
             stopSelf()
+        } else if (!player.playWhenReady) {
+            // Swiped away while paused: the notification stays for a while, like a music app.
+            holdWhilePaused()
         }
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(holdTick)
         hosts.toList().forEach { it.onServiceGone() }
         hosts.clear()
+        io.shutdown()
         nowPlayingKey = null
         handler.removeCallbacksAndMessages(null)
         savePosition()
@@ -508,6 +593,74 @@ class PlaybackService : MediaSessionService() {
         hosts.toList().forEach { it.onPlayerReplaced(p) }
     }
 
+    private fun setAttributesFor(audio: Boolean) {
+        player.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(if (audio) C.AUDIO_CONTENT_TYPE_MUSIC else C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(),
+            true
+        )
+    }
+
+    /**
+     * Android closed the app while it was paused and you came back: put the queue and the exact
+     * position back, paused, so the play button works. [onDone] gets false when there is nothing
+     * to restore.
+     */
+    fun restoreLast(onDone: (Boolean) -> Unit) {
+        val snap = LastSession.load()
+        if (snap == null) {
+            onDone(false)
+            return
+        }
+        io.execute {
+            val items = try {
+                if (snap.audio) {
+                    AudioRepo.loadSongs(applicationContext)
+                    AudioRepo.byKeys(snap.keys).map { AudioRepo.toMediaItem(it) }
+                } else {
+                    MediaRepo.loadVideos(applicationContext)
+                    MediaRepo.byKeys(snap.keys).map { MediaRepo.toMediaItem(it) }
+                }
+            } catch (e: Exception) {
+                emptyList()
+            }
+            handler.post {
+                if (items.isEmpty()) {
+                    onDone(false)
+                    return@post
+                }
+                if (player.mediaItemCount == 0) {
+                    val wanted = snap.keys.getOrNull(snap.index)
+                    val idx = items.indexOfFirst { it.mediaId == wanted }.coerceAtLeast(0)
+                    setAttributesFor(snap.audio)
+                    lastKey = items[idx].mediaId
+                    nowPlayingKey = items[idx].mediaId
+                    updateSessionActivity(items[idx])
+                    val pos = if (items[idx].mediaId == wanted) snap.positionMs else 0L
+                    player.setMediaItems(items, idx, pos)
+                    LastSession.savePosition(pos)
+                    player.prepare()
+                    player.playWhenReady = false
+                }
+                onDone(true)
+            }
+        }
+    }
+
+    /** One tap on play / pause, correct whatever state the player is in. */
+    fun togglePlay() {
+        val p = player
+        if (isActive(p)) {
+            p.pause()
+            return
+        }
+        if (p.playbackState == Player.STATE_IDLE) p.prepare()
+        if (p.playbackState == Player.STATE_ENDED) p.seekToDefaultPosition(p.currentMediaItemIndex)
+        p.play()
+    }
+
     /** Starts a queue (a whole folder) at [index], resuming where that file was left. */
     fun playQueue(items: List<MediaItem>, index: Int) {
         if (items.isEmpty()) return
@@ -519,13 +672,7 @@ class PlaybackService : MediaSessionService() {
         updateSessionActivity(items[i])
         lastDuration = 0
         val audio = items[i].isAudioItem()
-        player.setAudioAttributes(
-            AudioAttributes.Builder()
-                .setUsage(C.USAGE_MEDIA)
-                .setContentType(if (audio) C.AUDIO_CONTENT_TYPE_MUSIC else C.AUDIO_CONTENT_TYPE_MOVIE)
-                .build(),
-            true
-        )
+        setAttributesFor(audio)
         // Start silent and rise gently: songs right away, videos when the first picture is on screen.
         handler.removeCallbacks(rampTick)
         handler.removeCallbacks(firstFrameFallback)
@@ -554,8 +701,11 @@ class PlaybackService : MediaSessionService() {
         player.stop()
         player.clearMediaItems()
         cancelSleep()
+        LastSession.clear()
         lastKey = null
         nowPlayingKey = null
+        pausedSince = 0L
+        handler.removeCallbacks(holdTick)
         stopSelf()
     }
 
@@ -566,6 +716,7 @@ class PlaybackService : MediaSessionService() {
         if (duration == C.TIME_UNSET || duration <= 0) return
         val position = if (player.playbackState == Player.STATE_ENDED) duration else player.currentPosition
         PositionStore.save(item.mediaId, position, duration)
+        LastSession.savePosition(player.currentPosition)
         lastKey = item.mediaId
         lastDuration = duration
     }
