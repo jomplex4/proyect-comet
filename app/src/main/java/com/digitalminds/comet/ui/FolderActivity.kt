@@ -127,6 +127,7 @@ class FolderActivity : AppCompatActivity() {
     private fun render() {
         val list = visible()
         adapter.selection?.retainAll(all.map { it.key }.toSet())
+        adapter.query = query
         adapter.submit(list)
         b.empty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
         val total = all.sumOf { it.size }
@@ -213,6 +214,18 @@ class FolderActivity : AppCompatActivity() {
             }
         }
         b.btnSelDelete.setOnClickListener { deleteSelected() }
+        b.btnSelShare.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            SelectionTools.share(this, all.filter { sel.contains(it.key) }.map { it.uri }, "video/*")
+        }
+        b.btnSelInfo.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            val chosen = all.filter { sel.contains(it.key) }
+            SelectionTools.summary(
+                this, "video", chosen.map { it.name }, chosen.size,
+                chosen.sumOf { it.size }, chosen.sumOf { it.durationMs }, false
+            )
+        }
     }
 
     private fun exitSelection() {

@@ -5,7 +5,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.ActivityInfo
+import android.animation.ValueAnimator
 import android.content.res.Configuration
+import android.view.animation.DecelerateInterpolator
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -18,7 +20,6 @@ import android.provider.Settings
 import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
-import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
@@ -57,13 +58,21 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
     private lateinit var prefs: Prefs
     private lateinit var audio: AudioManager
     private lateinit var gestures: GestureDetector
-    private lateinit var scaler: ScaleGestureDetector
 
-    // Pinch zoom on top of Fill / Fit (0.5x to 4x) and two-finger pan while zoomed.
-    private var zoom = 1f
-    private var pinching = false
-    private var lastFocusX = 0f
-    private var lastFocusY = 0f
+    // Picture state. The frame always lays out as "Fit" (whole video, nothing cut). "Fill" is
+    // the same frame scaled up until it covers the screen, so there are only two real states
+    // and a smooth animation between them. Two fingers pan the picture when it is filled.
+    private var picScale = 1f
+    private var picTx = 0f
+    private var picTy = 0f
+    private var twoFinger = false
+    private var ignoreUntilUp = false
+    private var gStartSpan = 1f
+    private var gStartScale = 1f
+    private var gContentX = 0f
+    private var gContentY = 0f
+    private var gStartScaleForSnap = 1f
+    private var picAnimator: ValueAnimator? = null
 
     private var service: PlaybackService? = null
     private var player: ExoPlayer? = null
@@ -143,7 +152,7 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
             }
             updateTitle()
             updateNavButtons()
-            resetZoom()
+            resetPicture()
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -169,9 +178,12 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        prefs = Prefs(this)
+        // Decide the screen direction BEFORE anything is drawn, from what we already know about
+        // the video, so it opens straight in the right direction (no portrait flash, no black blink).
+        preselectOrientation()
         b = ActivityPlayerBinding.inflate(layoutInflater)
         setContentView(b.root)
-        prefs = Prefs(this)
         audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
         setupWindow()
@@ -180,7 +192,6 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
         setupGestures()
         setupPanel()
         applyResizeMode()
-        applyOrientationMode(null)
         applySavedBrightness()
         updateChips()
 
@@ -227,6 +238,13 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         if (hasFocus) hideSystemUi()
+    }
+
+    /** Home or recents pressed: the app is still in front, the best moment to go audio only. */
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        val p = player ?: return
+        if (!closing && prefs.backgroundPlay && p.playWhenReady) setVideoEnabled(p, false)
     }
 
     override fun onStop() {
@@ -399,10 +417,7 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
         }
 
         b.btnResize.setOnClickListener {
-            prefs.resizeMode = if (prefs.resizeMode == Prefs.RESIZE_FILL) Prefs.RESIZE_FIT else Prefs.RESIZE_FILL
-            resetZoom()
-            applyResizeMode()
-            showHud(if (prefs.resizeMode == Prefs.RESIZE_FILL) "Fill" else "Fit")
+            togglePicture()
             scheduleHide()
         }
 
@@ -527,7 +542,7 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
                 else -> R.drawable.ic_orient_auto
             }
         )
-        val muted = (player?.volume ?: 1f) == 0f
+        val muted = service?.isMuted() == true
         b.btnMute.setImageResource(if (muted) R.drawable.ic_mute else R.drawable.ic_volume)
         b.btnMute.setBackgroundResource(if (muted) R.drawable.bg_chip_on else R.drawable.bg_chip)
         b.btnBackground.setBackgroundResource(if (prefs.backgroundPlay) R.drawable.bg_chip_on else R.drawable.bg_chip)
@@ -603,17 +618,38 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
     // ================================================================ picture
 
     private fun applyResizeMode() {
-        val fill = prefs.resizeMode == Prefs.RESIZE_FILL
-        // Fill = expand to the whole screen keeping proportions (edges get cropped, never stretched).
-        b.videoFrame.resizeMode = if (fill) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
-        b.btnResize.setImageResource(if (fill) R.drawable.ic_fill else R.drawable.ic_fit)
+        // Always the whole picture first; Fill is a scale on top (see togglePicture).
+        b.videoFrame.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+        updateResizeIcon(picScale)
     }
 
     private fun applyVideoSize(vs: VideoSize?) {
         if (vs == null || vs.width == 0 || vs.height == 0) return
         val ratio = vs.width * vs.pixelWidthHeightRatio / vs.height
+        if (kotlin.math.abs(ratio - lastRatio) > 0.001f) {
+            lastRatio = ratio
+            resetPicture()
+        }
         b.videoFrame.setAspectRatio(ratio)
         applyOrientationMode(vs)
+    }
+
+    private var lastRatio = 0f
+
+    private fun preselectOrientation() {
+        val first = Launch.pending?.let { it.first.getOrNull(it.second) }
+        val extras = first?.mediaMetadata?.extras
+        val w = extras?.getInt("shownW") ?: 0
+        val h = extras?.getInt("shownH") ?: 0
+        requestedOrientation = when (prefs.orientation) {
+            Prefs.ORIENT_LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            Prefs.ORIENT_PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            else -> when {
+                w <= 0 || h <= 0 -> return
+                w >= h -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                else -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            }
+        }
     }
 
     private fun applyOrientationMode(vs: VideoSize?) {
@@ -688,77 +724,181 @@ class PlayerActivity : AppCompatActivity(), PlaybackService.Host {
                 return true
             }
         })
-        scaler = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
-            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                if (locked) return false
-                pinching = true
-                swipeMode = 0
-                lastFocusX = detector.focusX
-                lastFocusY = detector.focusY
-                return true
-            }
-
-            override fun onScale(detector: ScaleGestureDetector): Boolean {
-                zoom = (zoom * detector.scaleFactor).coerceIn(0.5f, 4f)
-                b.videoFrame.translationX += detector.focusX - lastFocusX
-                b.videoFrame.translationY += detector.focusY - lastFocusY
-                lastFocusX = detector.focusX
-                lastFocusY = detector.focusY
-                applyZoom()
-                showHud("Zoom " + (zoom * 100).roundToInt() + "%")
-                return true
-            }
-
-            override fun onScaleEnd(detector: ScaleGestureDetector) {
-                // Snap back to exactly 100% when close to it.
-                if (abs(zoom - 1f) < 0.07f) resetZoom()
-            }
-        })
         b.gestureLayer.setOnTouchListener { v, e ->
-            scaler.onTouchEvent(e)
-            if (e.actionMasked == MotionEvent.ACTION_POINTER_DOWN) {
-                // Second finger: this is a pinch, cancel taps and swipes in progress.
+            handleTouch(e)
+            if (e.actionMasked == MotionEvent.ACTION_UP && !ignoreUntilUp && !twoFinger) v.performClick()
+            true
+        }
+    }
+
+    private fun handleTouch(e: MotionEvent) {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                ignoreUntilUp = false
+                twoFinger = false
+                gestures.onTouchEvent(e)
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (locked || e.pointerCount != 2) return
+                // Second finger: cancel any tap or swipe in progress and start the picture gesture
+                // right now, with no threshold to cross first.
                 val cancel = MotionEvent.obtain(e)
                 cancel.action = MotionEvent.ACTION_CANCEL
                 gestures.onTouchEvent(cancel)
                 cancel.recycle()
                 swipeMode = 0
+                beginTwoFinger(e)
             }
-            if (e.pointerCount == 1 && !pinching) gestures.onTouchEvent(e)
-            if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) {
+            MotionEvent.ACTION_MOVE -> {
+                if (twoFinger && e.pointerCount >= 2) moveTwoFinger(e)
+                else if (!ignoreUntilUp && e.pointerCount == 1) gestures.onTouchEvent(e)
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (twoFinger) endTwoFinger()
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (twoFinger) endTwoFinger()
+                if (!ignoreUntilUp) gestures.onTouchEvent(e)
                 swipeMode = 0
-                pinching = false
-                if (e.actionMasked == MotionEvent.ACTION_UP) v.performClick()
+                twoFinger = false
+                ignoreUntilUp = false
             }
-            true
+            else -> {}
         }
     }
 
-    private fun applyZoom() {
+    /** Scale that makes the fitted frame cover the whole screen (1 when it already does). */
+    private fun fillScale(): Float {
         val f = b.videoFrame
-        f.scaleX = zoom
-        f.scaleY = zoom
-        // Keep the picture covering the screen: no dragging it off into black.
-        val maxX = ((f.width * zoom - b.root.width) / 2f).coerceAtLeast(0f)
-        val maxY = ((f.height * zoom - b.root.height) / 2f).coerceAtLeast(0f)
-        f.translationX = f.translationX.coerceIn(-maxX, maxX)
-        f.translationY = f.translationY.coerceIn(-maxY, maxY)
+        val fw = f.width.toFloat()
+        val fh = f.height.toFloat()
+        if (fw <= 0f || fh <= 0f) return 1f
+        return maxOf(b.root.width / fw, b.root.height / fh).coerceAtLeast(1f)
     }
 
-    private fun resetZoom() {
-        zoom = 1f
-        b.videoFrame.scaleX = 1f
-        b.videoFrame.scaleY = 1f
-        b.videoFrame.translationX = 0f
-        b.videoFrame.translationY = 0f
+    private fun focusOf(e: MotionEvent): Pair<Float, Float> =
+        Pair((e.getX(0) + e.getX(1)) / 2f, (e.getY(0) + e.getY(1)) / 2f)
+
+    private fun spanOf(e: MotionEvent): Float {
+        val dx = e.getX(0) - e.getX(1)
+        val dy = e.getY(0) - e.getY(1)
+        return Math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(1f)
+    }
+
+    private fun beginTwoFinger(e: MotionEvent) {
+        picAnimator?.cancel()
+        twoFinger = true
+        ignoreUntilUp = true
+        gStartSpan = spanOf(e)
+        gStartScale = picScale
+        gStartScaleForSnap = picScale
+        val (fx, fy) = focusOf(e)
+        // The point of the picture under the fingers must stay under the fingers.
+        gContentX = (fx - b.root.width / 2f - picTx) / picScale
+        gContentY = (fy - b.root.height / 2f - picTy) / picScale
+    }
+
+    private fun moveTwoFinger(e: MotionEvent) {
+        val fill = fillScale()
+        val canScale = fill > 1.02f
+        val scale = if (canScale) {
+            (gStartScale * spanOf(e) / gStartSpan).coerceIn(0.75f, fill * 1.2f)
+        } else picScale
+        val (fx, fy) = focusOf(e)
+        picScale = scale
+        picTx = fx - b.root.width / 2f - scale * gContentX
+        picTy = fy - b.root.height / 2f - scale * gContentY
+        clampPicture(false)
+        applyPicture()
+    }
+
+    private fun endTwoFinger() {
+        twoFinger = false
+        val fill = fillScale()
+        val ratio = picScale / gStartScaleForSnap
+        val target = when {
+            fill <= 1.02f -> 1f
+            ratio > 1.04f -> fill
+            ratio < 0.96f -> 1f
+            else -> if (gStartScaleForSnap > 1.02f) fill else 1f
+        }
+        animatePicture(target)
+        showHud(if (target > 1.02f) "Fill" else "Fit")
+        updateResizeIcon(target)
+    }
+
+    /** Keeps the picture covering what it should: centered when small, edge to edge when large. */
+    private fun clampPicture(forScale: Boolean) {
+        val f = b.videoFrame
+        val maxX = ((f.width * picScale - b.root.width) / 2f).coerceAtLeast(0f)
+        val maxY = ((f.height * picScale - b.root.height) / 2f).coerceAtLeast(0f)
+        picTx = picTx.coerceIn(-maxX, maxX)
+        picTy = picTy.coerceIn(-maxY, maxY)
+        if (forScale && picScale <= 1.02f) {
+            picTx = 0f
+            picTy = 0f
+        }
+    }
+
+    private fun applyPicture() {
+        val f = b.videoFrame
+        f.scaleX = picScale
+        f.scaleY = picScale
+        f.translationX = picTx
+        f.translationY = picTy
+    }
+
+    private fun animatePicture(target: Float) {
+        picAnimator?.cancel()
+        val s0 = picScale
+        val x0 = picTx
+        val y0 = picTy
+        val anim = ValueAnimator.ofFloat(0f, 1f)
+        anim.duration = 200
+        anim.interpolator = DecelerateInterpolator()
+        anim.addUpdateListener {
+            val t = it.animatedValue as Float
+            picScale = s0 + (target - s0) * t
+            // Fit goes back to the center; Fill keeps where you moved it (inside the limits).
+            val k = if (target <= 1.02f) 1f - t else 1f
+            picTx = x0 * k
+            picTy = y0 * k
+            clampPicture(false)
+            applyPicture()
+        }
+        anim.start()
+        picAnimator = anim
+    }
+
+    /** Fit and Fill button: flips between the two states. */
+    private fun togglePicture() {
+        val fill = fillScale()
+        val target = if (picScale > 1.02f || fill <= 1.02f) 1f else fill
+        animatePicture(target)
+        showHud(if (target > 1.02f) "Fill" else "Fit")
+        updateResizeIcon(target)
+    }
+
+    private fun updateResizeIcon(scale: Float) {
+        b.btnResize.setImageResource(if (scale > 1.02f) R.drawable.ic_fit else R.drawable.ic_fill)
+    }
+
+    private fun resetPicture() {
+        picAnimator?.cancel()
+        picScale = 1f
+        picTx = 0f
+        picTy = 0f
+        applyPicture()
+        updateResizeIcon(1f)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        resetZoom()
+        // Turning the phone: go back to the whole picture (Fit), not a stretched crop.
+        resetPicture()
     }
 
-        private fun currentBrightness(): Float {
+    private fun currentBrightness(): Float {
         val w = window.attributes.screenBrightness
         if (w >= 0f) return w
         return try {

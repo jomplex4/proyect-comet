@@ -152,6 +152,18 @@ class PhotoFolderActivity : AppCompatActivity() {
                 updateSelectionBar()
             }
         }
+        b.btnSelShare.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            SelectionTools.share(this, all.filter { sel.contains(it.key) }.map { it.uri }, "image/*")
+        }
+        b.btnSelInfo.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            val chosen = all.filter { sel.contains(it.key) }
+            SelectionTools.summary(
+                this, "photo", chosen.map { it.name }, chosen.size,
+                chosen.sumOf { it.size }, null, false
+            )
+        }
         b.btnSelDelete.setOnClickListener {
             val sel = adapter.selection ?: return@setOnClickListener
             deleter.delete(all.filter { sel.contains(it.key) }.map { it.uri }, "photo")

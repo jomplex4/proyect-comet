@@ -1,22 +1,24 @@
 package com.digitalminds.comet.service
 
 import android.app.PendingIntent
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.media.audiofx.AudioEffect
 import android.net.Uri
 import android.os.Binder
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import androidx.core.app.NotificationManagerCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.util.BitmapLoader
 import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.exoplayer.DefaultRenderersFactory
@@ -26,6 +28,7 @@ import androidx.media3.exoplayer.mediacodec.MediaCodecSelector
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.session.CacheBitmapLoader
+import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import com.digitalminds.comet.data.isAudioItem
@@ -99,7 +102,46 @@ class PlaybackService : MediaSessionService() {
     // Sleep timer: absolute end time, or "end of the current file". Volume fades out at the end.
     private var sleepAt = 0L
     private var sleepEndOfItem = false
-    private var fadeBase = -1f
+
+    // Volume = mute switch x start ramp x sleep fade. Every change goes through applyVolume(),
+    // so a fade-in, a fade-out and the mute button never fight each other.
+    private var userMuted = false
+    private var rampFactor = 1f
+    private var rampFrom = 1f
+    private var rampStart = 0L
+    private var rampMs = 1L
+    private var sleepFactor = 1f
+    private var awaitingFirstFrame = false
+
+    private fun applyVolume() {
+        player.volume = if (userMuted) 0f else (rampFactor * sleepFactor).coerceIn(0f, 1f)
+    }
+
+    private val rampTick = object : Runnable {
+        override fun run() {
+            val t = ((SystemClock.elapsedRealtime() - rampStart).toFloat() / rampMs).coerceIn(0f, 1f)
+            val eased = t * t * (3f - 2f * t) // smooth start and end, no click
+            rampFactor = rampFrom + (1f - rampFrom) * eased
+            applyVolume()
+            if (t < 1f) handler.postDelayed(this, 16)
+        }
+    }
+
+    /** Raises the volume from where it is to full, gently. */
+    private fun startFadeIn(ms: Long) {
+        handler.removeCallbacks(rampTick)
+        rampFrom = rampFactor
+        rampStart = SystemClock.elapsedRealtime()
+        rampMs = ms.coerceAtLeast(1)
+        handler.post(rampTick)
+    }
+
+    private val firstFrameFallback = Runnable {
+        if (awaitingFirstFrame) {
+            awaitingFirstFrame = false
+            startFadeIn(300)
+        }
+    }
 
     private val sleepTick = object : Runnable {
         override fun run() {
@@ -110,8 +152,8 @@ class PlaybackService : MediaSessionService() {
                 return
             }
             if (remaining <= FADE_MS && player.isPlaying) {
-                if (fadeBase < 0f) fadeBase = player.volume
-                player.volume = fadeBase * (remaining.toFloat() / FADE_MS).coerceIn(0f, 1f)
+                sleepFactor = (remaining.toFloat() / FADE_MS).coerceIn(0f, 1f)
+                applyVolume()
             } else {
                 restoreFade()
             }
@@ -151,6 +193,25 @@ class PlaybackService : MediaSessionService() {
             if (!playWhenReady && reason == Player.PLAY_WHEN_READY_CHANGE_REASON_END_OF_MEDIA_ITEM && sleepEndOfItem) {
                 finishSleep()
             }
+            // Coming back from pause: bring the sound up softly instead of cutting in.
+            if (playWhenReady && !awaitingFirstFrame && sleepFactor == 1f) {
+                rampFactor = 0f
+                applyVolume()
+                startFadeIn(160)
+            }
+        }
+
+        override fun onRenderedFirstFrame() {
+            if (awaitingFirstFrame) {
+                awaitingFirstFrame = false
+                handler.removeCallbacks(firstFrameFallback)
+                startFadeIn(300)
+            }
+        }
+
+        override fun onTrackSelectionParametersChanged(parameters: TrackSelectionParameters) {
+            // Video turned off (Background Play) or back on: the notification may need to appear or go.
+            refreshNotification()
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -184,6 +245,38 @@ class PlaybackService : MediaSessionService() {
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
 
+    // ---------------------------------------------------------------- notification
+
+    /**
+     * The notification is for music, and for a video that keeps going as audio (Background
+     * Play). A video you are watching on screen needs none.
+     */
+    private fun wantsNotification(): Boolean {
+        val item = player.currentMediaItem ?: return true
+        if (item.isAudioItem()) return true
+        return player.trackSelectionParameters.disabledTrackTypes.contains(C.TRACK_TYPE_VIDEO)
+    }
+
+    override fun onUpdateNotification(session: MediaSession, startInForegroundRequired: Boolean) {
+        if (wantsNotification()) {
+            super.onUpdateNotification(session, startInForegroundRequired)
+        } else {
+            stopForeground(Service.STOP_FOREGROUND_REMOVE)
+            NotificationManagerCompat.from(this).cancel(DefaultMediaNotificationProvider.DEFAULT_NOTIFICATION_ID)
+        }
+    }
+
+    private fun refreshNotification() {
+        val s = session ?: return
+        val state = player.playbackState
+        val running = player.playWhenReady && (state == Player.STATE_READY || state == Player.STATE_BUFFERING)
+        try {
+            onUpdateNotification(s, running)
+        } catch (e: Exception) {
+            // The system may refuse to start a foreground service right now; playback is not affected.
+        }
+    }
+
     override fun onBind(intent: Intent?): IBinder? {
         if (intent?.action == ACTION_LOCAL_BIND) return binder
         return super.onBind(intent)
@@ -209,7 +302,6 @@ class PlaybackService : MediaSessionService() {
         savePosition()
         session?.release()
         session = null
-        effectSession(player.audioSessionId, false)
         player.release()
         super.onDestroy()
     }
@@ -263,14 +355,14 @@ class PlaybackService : MediaSessionService() {
 
     fun isSleepEndOfItem(): Boolean = sleepEndOfItem
 
-    /** Mute / unmute that also plays well with a sleep-timer fade in progress. Returns the new state. */
+    /** Mute / unmute. Returns the new state. */
     fun toggleMute(): Boolean {
-        val mutedNow = if (fadeBase >= 0f) fadeBase == 0f else player.volume == 0f
-        val muted = !mutedNow
-        if (fadeBase >= 0f) fadeBase = if (muted) 0f else 1f
-        player.volume = if (muted) 0f else 1f
-        return muted
+        userMuted = !userMuted
+        applyVolume()
+        return userMuted
     }
+
+    fun isMuted(): Boolean = userMuted
 
     /** Milliseconds until the timer stops playback, or -1 when no timer is set. */
     fun sleepRemainingMs(): Long {
@@ -285,9 +377,9 @@ class PlaybackService : MediaSessionService() {
     }
 
     private fun restoreFade() {
-        if (fadeBase >= 0f) {
-            player.volume = fadeBase
-            fadeBase = -1f
+        if (sleepFactor != 1f) {
+            sleepFactor = 1f
+            applyVolume()
         }
     }
 
@@ -324,6 +416,7 @@ class PlaybackService : MediaSessionService() {
         val renderers = DefaultRenderersFactory(this)
             .setMediaCodecSelector(selector)
             .setEnableDecoderFallback(true)
+            .setEnableAudioFloatOutput(true) // 24 / 32 bit files keep their depth instead of being cut to 16 bit
         val extractors = DefaultExtractorsFactory().setConstantBitrateSeekingEnabled(true)
         val attrs = AudioAttributes.Builder()
             .setUsage(C.USAGE_MEDIA)
@@ -349,25 +442,7 @@ class PlaybackService : MediaSessionService() {
             }
         })
         applyMode(p, prefs.repeatMode)
-        effectSession(p.audioSessionId, true)
         return p
-    }
-
-    /** Lets the phone equalizer (Samsung SoundAlive, etc.) attach to COMET's audio. */
-    private fun effectSession(sessionId: Int, open: Boolean) {
-        if (sessionId == C.AUDIO_SESSION_ID_UNSET) return
-        val action = if (open) AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION
-        else AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION
-        try {
-            sendBroadcast(
-                Intent(action)
-                    .putExtra(AudioEffect.EXTRA_AUDIO_SESSION, sessionId)
-                    .putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
-                    .putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
-            )
-        } catch (e: Exception) {
-            // No equalizer app on the phone; nothing to tell.
-        }
     }
 
     private fun applyMode(p: ExoPlayer, mode: Int) {
@@ -411,20 +486,18 @@ class PlaybackService : MediaSessionService() {
         val position = old.currentPosition
         val playWhenReady = old.playWhenReady
         val params = old.playbackParameters
-        val volume = old.volume
         val tracks = old.trackSelectionParameters
         savePosition()
         old.removeListener(playerListener)
-        effectSession(old.audioSessionId, false)
         old.release()
         videoDecoderName = null
 
         val p = buildPlayer(software)
         p.playbackParameters = params
-        p.volume = volume
         p.trackSelectionParameters = tracks
         if (sleepEndOfItem) p.pauseAtEndOfMediaItems = true
         player = p
+        applyVolume()
         if (items.isNotEmpty()) {
             lastKey = items.getOrNull(index)?.mediaId
             p.setMediaItems(items, index, position)
@@ -445,9 +518,24 @@ class PlaybackService : MediaSessionService() {
         nowPlayingKey = items[i].mediaId
         updateSessionActivity(items[i])
         lastDuration = 0
+        val audio = items[i].isAudioItem()
+        player.setAudioAttributes(
+            AudioAttributes.Builder()
+                .setUsage(C.USAGE_MEDIA)
+                .setContentType(if (audio) C.AUDIO_CONTENT_TYPE_MUSIC else C.AUDIO_CONTENT_TYPE_MOVIE)
+                .build(),
+            true
+        )
+        // Start silent and rise gently: songs right away, videos when the first picture is on screen.
+        handler.removeCallbacks(rampTick)
+        handler.removeCallbacks(firstFrameFallback)
+        rampFactor = 0f
+        applyVolume()
+        awaitingFirstFrame = !audio
         player.setMediaItems(items, i, start)
         player.prepare()
         player.play()
+        if (audio) startFadeIn(260) else handler.postDelayed(firstFrameFallback, 1500)
     }
 
     fun next() {

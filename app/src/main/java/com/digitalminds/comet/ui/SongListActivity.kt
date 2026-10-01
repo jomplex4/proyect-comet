@@ -130,6 +130,7 @@ class SongListActivity : AppCompatActivity() {
     private fun render() {
         val list = visible()
         adapter.selection?.retainAll(all.map { it.key }.toSet())
+        adapter.query = query
         adapter.submit(list)
         b.empty.visibility = if (list.isEmpty()) View.VISIBLE else View.GONE
         b.empty.text = when {
@@ -219,6 +220,18 @@ class SongListActivity : AppCompatActivity() {
                 adapter.notifyDataSetChanged()
                 updateSelectionBar()
             }
+        }
+        b.btnSelShare.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            SelectionTools.share(this, all.filter { sel.contains(it.key) }.map { it.uri }, "audio/*")
+        }
+        b.btnSelInfo.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            val chosen = all.filter { sel.contains(it.key) }
+            SelectionTools.summary(
+                this, "song", chosen.map { it.title }, chosen.size,
+                chosen.sumOf { it.size }, chosen.sumOf { it.durationMs }, false
+            )
         }
         b.btnSelDelete.setOnClickListener {
             val sel = adapter.selection ?: return@setOnClickListener

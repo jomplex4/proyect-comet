@@ -35,6 +35,7 @@
     <TextView
         android:id="@+id/folderName"
         android:layout_width="wrap_content"
+        android:layout_weight="0"
         android:layout_height="wrap_content"
         android:layout_marginStart="14dp"
         android:ellipsize="end"
@@ -50,4 +51,17 @@
         android:maxLines="1"
         android:textColor="@color/muted"
         android:textSize="14sp" />
+
+    <Space
+        android:layout_width="0dp"
+        android:layout_height="1dp"
+        android:layout_weight="1" />
+
+    <ImageView
+        android:id="@+id/folderCheck"
+        android:layout_width="22dp"
+        android:layout_height="22dp"
+        android:contentDescription="@null"
+        android:padding="4dp"
+        android:visibility="gone" />
 </LinearLayout>

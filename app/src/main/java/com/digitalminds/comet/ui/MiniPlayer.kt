@@ -8,7 +8,9 @@ import android.content.ServiceConnection
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -22,10 +24,10 @@ import com.digitalminds.comet.util.Thumbs
 
 /**
  * The small bar above the bottom menu that shows what keeps playing in the background
- * (a video playing as audio today, music in the next build): prev / play / next, stop,
- * and a tap opens the full player again.
+ * (music, or a video playing as audio): previous / play / next.
  *
- * It never starts the service by itself: it only attaches if something is already playing.
+ * Tap: open the full player. Swipe left or right: stop and close it. Swipe up: the queue.
+ * It only attaches if something is already playing, or when [play] starts something.
  */
 class MiniPlayer(
     private val activity: Activity,
@@ -35,6 +37,7 @@ class MiniPlayer(
 ) : PlaybackService.Host {
 
     private var service: PlaybackService? = null
+    private var pendingQueue: Pair<List<MediaItem>, Int>? = null
     private var player: ExoPlayer? = null
     private var bound = false
     private val handler = Handler(Looper.getMainLooper())
@@ -51,6 +54,9 @@ class MiniPlayer(
             val svc = (binder as? PlaybackService.LocalBinder)?.service() ?: return
             service = svc
             svc.addHost(this@MiniPlayer)
+            val queue = pendingQueue
+            pendingQueue = null
+            if (queue != null) svc.playQueue(queue.first, queue.second)
             attach(svc.player)
         }
 
@@ -70,15 +76,9 @@ class MiniPlayer(
     init {
         b.root.clipToOutline = true
         b.miniThumbBox.clipToOutline = true
-        b.miniOpen.setOnClickListener {
-            val audio = player?.currentMediaItem?.isAudioItem() == true
-            val target = if (audio) MusicPlayerActivity::class.java else PlayerActivity::class.java
-            activity.startActivity(Intent(activity, target))
-        }
-        b.miniQueue.setOnClickListener {
-            val svc = service ?: return@setOnClickListener
-            QueueSheet.show(activity, svc)
-        }
+        b.miniOpen.setOnClickListener { openFull() }
+        setupSwipe()
+        b.miniPrev.setOnClickListener { service?.previous() }
         b.miniPlay.setOnClickListener {
             val p = player ?: return@setOnClickListener
             if (p.isPlaying) {
@@ -90,11 +90,105 @@ class MiniPlayer(
             }
         }
         b.miniNext.setOnClickListener { service?.next() }
-        b.miniClose.setOnClickListener {
-            service?.stopAndClear()
-            detach()
-            render()
+    }
+
+    private fun openFull() {
+        val audio = player?.currentMediaItem?.isAudioItem() == true
+        val target = if (audio) MusicPlayerActivity::class.java else PlayerActivity::class.java
+        activity.startActivity(Intent(activity, target))
+    }
+
+    private fun closeForever() {
+        service?.stopAndClear()
+        detach()
+        render()
+    }
+
+    /** Swipe sideways to close, up for the queue; a plain tap still opens the player. */
+    private fun setupSwipe() {
+        val d = activity.resources.displayMetrics.density
+        val slop = ViewConfiguration.get(activity).scaledTouchSlop
+        var downX = 0f
+        var downY = 0f
+        var mode = 0 // 0 undecided, 1 sideways, 2 up
+        b.miniOpen.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX
+                    downY = e.rawY
+                    mode = 0
+                    v.isPressed = true
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    val dx = e.rawX - downX
+                    val dy = e.rawY - downY
+                    if (mode == 0) {
+                        if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy)) mode = 1
+                        else if (dy < -slop && Math.abs(dy) > Math.abs(dx)) mode = 2
+                        if (mode != 0) {
+                            v.isPressed = false
+                            v.parent?.requestDisallowInterceptTouchEvent(true)
+                        }
+                    }
+                    when (mode) {
+                        1 -> {
+                            b.root.translationX = dx
+                            b.root.alpha = (1f - Math.abs(dx) / (b.root.width * 0.9f)).coerceIn(0.2f, 1f)
+                        }
+                        2 -> b.root.translationY = (dy / 3f).coerceIn(-18f * d, 0f)
+                    }
+                }
+                MotionEvent.ACTION_UP -> {
+                    val dx = e.rawX - downX
+                    val dy = e.rawY - downY
+                    v.isPressed = false
+                    when {
+                        mode == 1 && Math.abs(dx) > Math.min(b.root.width * 0.35f, 140 * d) -> {
+                            val out = if (dx > 0) b.root.width.toFloat() else -b.root.width.toFloat()
+                            b.root.animate().translationX(out).alpha(0f).setDuration(160).withEndAction {
+                                closeForever()
+                                b.root.translationX = 0f
+                                b.root.alpha = 1f
+                            }.start()
+                        }
+                        mode == 2 && dy < -40 * d -> {
+                            resetPosition()
+                            service?.let { QueueSheet.show(activity, it) }
+                        }
+                        mode == 0 -> v.performClick()
+                        else -> resetPosition()
+                    }
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    v.isPressed = false
+                    resetPosition()
+                }
+            }
+            true
         }
+    }
+
+    private fun resetPosition() {
+        b.root.animate().translationX(0f).translationY(0f).alpha(1f).setDuration(140).start()
+    }
+
+    /**
+     * Starts a queue from a screen that has no player of its own (a recent audio in the list).
+     * Only the little bar and the notification show up; the full player is not opened.
+     */
+    fun play(items: List<MediaItem>, index: Int) {
+        val svc = service
+        if (svc != null) {
+            svc.playQueue(items, index)
+            return
+        }
+        pendingQueue = items to index
+        if (bound) {
+            try { activity.unbindService(connection) } catch (e: Exception) { }
+            bound = false
+        }
+        val i = Intent(activity, PlaybackService::class.java).setAction(PlaybackService.ACTION_LOCAL_BIND)
+        bound = activity.bindService(i, connection, Context.BIND_AUTO_CREATE)
     }
 
     /** Call from onStart. */

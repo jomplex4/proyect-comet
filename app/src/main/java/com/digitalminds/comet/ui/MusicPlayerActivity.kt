@@ -4,7 +4,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.media.audiofx.AudioEffect
 import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
@@ -324,7 +323,6 @@ class MusicPlayerActivity : AppCompatActivity(), PlaybackService.Host {
             b.speedPanel.visibility = if (b.speedPanel.visibility == View.VISIBLE) View.GONE else View.VISIBLE
             if (b.speedPanel.visibility == View.VISIBLE) buildSpeedRow()
         }
-        b.btnEq.setOnClickListener { openEqualizer() }
         b.btnAddPlaylist.setOnClickListener {
             val key = player?.currentMediaItem?.mediaId ?: return@setOnClickListener
             Dialogs.addToPlaylist(this, key) { name ->
@@ -403,21 +401,6 @@ class MusicPlayerActivity : AppCompatActivity(), PlaybackService.Host {
             }
             Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
             updateTimer()
-        }
-    }
-
-    /** Opens the phone equalizer (Samsung SoundAlive, etc.) for COMET: 0 KB added to the app. */
-    private fun openEqualizer() {
-        val session = player?.audioSessionId ?: C.AUDIO_SESSION_ID_UNSET
-        val i = Intent(AudioEffect.ACTION_DISPLAY_AUDIO_EFFECT_CONTROL_PANEL)
-            .putExtra(AudioEffect.EXTRA_PACKAGE_NAME, packageName)
-            .putExtra(AudioEffect.EXTRA_CONTENT_TYPE, AudioEffect.CONTENT_TYPE_MUSIC)
-        if (session != C.AUDIO_SESSION_ID_UNSET) i.putExtra(AudioEffect.EXTRA_AUDIO_SESSION, session)
-        try {
-            @Suppress("DEPRECATION")
-            startActivityForResult(i, 7)
-        } catch (e: Exception) {
-            Toast.makeText(this, "No equalizer found on this phone", Toast.LENGTH_SHORT).show()
         }
     }
 

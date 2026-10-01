@@ -31,6 +31,7 @@ import com.digitalminds.comet.data.Photo
 import com.digitalminds.comet.data.PhotoRepo
 import com.digitalminds.comet.databinding.ActivityPhotoViewerBinding
 import com.digitalminds.comet.util.Format
+import com.digitalminds.comet.util.RegionLoader
 import com.digitalminds.comet.util.Thumbs
 import java.util.concurrent.Executors
 
@@ -76,10 +77,12 @@ class PhotoViewerActivity : AppCompatActivity() {
         override fun onBindViewHolder(holder: PageVH, position: Int) {
             val p = photos[position]
             holder.boundKey = p.key
+            holder.page.setRegionLoader(null)
             val cached = full.get(p.key)
             if (cached != null) {
                 holder.page.tag = null
                 holder.page.setImageBitmap(cached)
+                attachDetail(holder, p)
                 return
             }
             // Quick small version first, sharp one when ready.
@@ -91,8 +94,26 @@ class PhotoViewerActivity : AppCompatActivity() {
                     if (holder.boundKey == p.key && bmp != null) {
                         holder.page.tag = null // a late small preview must not replace the sharp one
                         holder.page.setImageBitmap(bmp)
+                        attachDetail(holder, p)
                     }
                 }
+            }
+        }
+
+        override fun onViewRecycled(holder: PageVH) {
+            holder.boundKey = null
+            holder.page.setRegionLoader(null)
+        }
+    }
+
+    /** Lets this page re-read the zoomed part at the file's real resolution. */
+    private fun attachDetail(holder: PageVH, p: Photo) {
+        io.execute {
+            val l = RegionLoader(this, p.uri)
+            val ok = l.open()
+            main.post {
+                if (ok && holder.boundKey == p.key && !isDestroyed) holder.page.setRegionLoader(l)
+                else io.execute { l.close() }
             }
         }
     }

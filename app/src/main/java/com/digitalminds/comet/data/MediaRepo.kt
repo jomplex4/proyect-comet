@@ -23,9 +23,14 @@ data class Video(
     val dateModified: Long,
     val width: Int,
     val height: Int,
-    val path: String
+    val path: String,
+    val rotation: Int = 0
 ) {
     val key: String get() = uri.toString()
+
+    /** Size as the picture is seen (a phone video recorded upright is tall even if stored wide). */
+    val shownWidth: Int get() = if (rotation == 90 || rotation == 270) height else width
+    val shownHeight: Int get() = if (rotation == 90 || rotation == 270) width else height
 }
 
 data class Folder(val id: String, val name: String, val videos: List<Video>) {
@@ -52,7 +57,7 @@ object MediaRepo {
         val cols = arrayOf(
             "_id", "_display_name", "bucket_id", "bucket_display_name", "duration",
             "_size", "date_added", "date_modified", "width", "height", "_data"
-        )
+        ).let { if (Build.VERSION.SDK_INT >= 29) it + "orientation" else it }
         val base = collection()
         try {
             ctx.contentResolver.query(base, cols, "_size > 0", null, null)?.use { c ->
@@ -67,6 +72,7 @@ object MediaRepo {
                 val iW = c.getColumnIndex("width")
                 val iH = c.getColumnIndex("height")
                 val iData = c.getColumnIndex("_data")
+                val iRot = c.getColumnIndex("orientation")
                 while (c.moveToNext()) {
                     val id = c.getLong(iId)
                     val name = (if (iName >= 0) c.getString(iName) else null) ?: continue
@@ -88,7 +94,8 @@ object MediaRepo {
                             dateModified = if (iMod >= 0) c.getLong(iMod) else 0L,
                             width = if (iW >= 0) c.getInt(iW) else 0,
                             height = if (iH >= 0) c.getInt(iH) else 0,
-                            path = path
+                            path = path,
+                            rotation = if (iRot >= 0) c.getInt(iRot) else 0
                         )
                     )
                 }
@@ -127,6 +134,8 @@ object MediaRepo {
             putString("path", v.path)
             putLong("size", v.size)
             putLong("modified", v.dateModified)
+            putInt("shownW", v.shownWidth)
+            putInt("shownH", v.shownHeight)
         }
         return MediaItem.Builder()
             .setUri(v.uri)

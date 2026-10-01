@@ -12,6 +12,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.core.content.res.ResourcesCompat
@@ -134,7 +135,8 @@ object Dialogs {
 
     /**
      * [onPick]: minutes (0 = off), or -1 for "end of the current file".
-     * [endLabel] is "End of video" or "End of song".
+     * [endLabel] is "End of video" or "End of song". Quick options go up to 1 hour;
+     * "Custom" lets you choose any number of minutes up to 2 hours.
      */
     fun sleepTimer(ctx: Context, remainingText: String?, endLabel: String, onDismiss: () -> Unit, onPick: (Int) -> Unit) {
         val root = LinearLayout(ctx).apply {
@@ -152,7 +154,7 @@ object Dialogs {
         var dialog: AlertDialog? = null
         val options = listOf(
             0 to "Off", 15 to "15 minutes", 30 to "30 minutes", 45 to "45 minutes",
-            60 to "1 hour", 90 to "1 hour 30 minutes", -1 to endLabel
+            60 to "1 hour", -1 to endLabel
         )
         options.forEach { (value, label) ->
             root.addView(row(ctx, label, 0, null) {
@@ -160,6 +162,11 @@ object Dialogs {
                 dialog?.dismiss()
             })
         }
+        root.addView(row(ctx, "Custom (up to 2 hours)", 0, null) {
+            openingCustom = true
+            dialog?.dismiss()
+            customTimer(ctx, onPick, onDismiss)
+        })
         root.addView(TextView(ctx).apply {
             text = "The sound fades out during the last 5 seconds."
             setTextColor(ctx.getColor(R.color.muted))
@@ -169,6 +176,80 @@ object Dialogs {
         dialog = AlertDialog.Builder(ctx, R.style.Theme_Comet_Dialog)
             .setTitle("Sleep Timer")
             .setView(ScrollView(ctx).apply { addView(root) })
+            .setOnDismissListener { if (!openingCustom) onDismiss() }
+            .show()
+    }
+
+    private var openingCustom = false
+
+    /** Slider from 1 to 120 minutes with big +/- buttons for fine adjustment. */
+    private fun customTimer(ctx: Context, onPick: (Int) -> Unit, onDismiss: () -> Unit) {
+        openingCustom = false
+        var minutes = 90
+        val label = TextView(ctx).apply {
+            setTextColor(Color.WHITE)
+            textSize = 26f
+            gravity = Gravity.CENTER
+            typeface = ResourcesCompat.getFont(ctx, R.font.space_grotesk_bold)
+        }
+        fun paint() {
+            val h = minutes / 60
+            val m = minutes % 60
+            label.text = when {
+                h == 0 -> "$m min"
+                m == 0 -> "$h h"
+                else -> "$h h $m min"
+            }
+        }
+        val seek = SeekBar(ctx).apply {
+            max = 119 // 1..120 minutes
+            progress = minutes - 1
+            progressDrawable = ctx.getDrawable(R.drawable.seek_progress)
+            thumb = ctx.getDrawable(R.drawable.seek_thumb)
+            splitTrack = false
+            setPadding(dp(ctx, 16), dp(ctx, 8), dp(ctx, 16), dp(ctx, 8))
+        }
+        seek.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                minutes = progress + 1
+                paint()
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+        fun step(label: String, delta: Int) = TextView(ctx).apply {
+            text = label
+            setTextColor(Color.WHITE)
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setBackgroundResource(R.drawable.bg_pill_dark)
+            layoutParams = LinearLayout.LayoutParams(0, dp(ctx, 40), 1f).apply { marginStart = dp(ctx, 4); marginEnd = dp(ctx, 4) }
+            setOnClickListener {
+                minutes = (minutes + delta).coerceIn(1, 120)
+                seek.progress = minutes - 1
+                paint()
+            }
+        }
+        val steps = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(step("-10", -10))
+            addView(step("-1", -1))
+            addView(step("+1", 1))
+            addView(step("+10", 10))
+        }
+        val box = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(ctx, 20), dp(ctx, 12), dp(ctx, 20), dp(ctx, 4))
+            addView(label)
+            addView(seek)
+            addView(steps)
+        }
+        paint()
+        AlertDialog.Builder(ctx, R.style.Theme_Comet_Dialog)
+            .setTitle("Custom timer")
+            .setView(box)
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Start") { _, _ -> onPick(minutes) }
             .setOnDismissListener { onDismiss() }
             .show()
     }

@@ -1,6 +1,7 @@
 package com.digitalminds.comet.ui
 
 import android.net.Uri
+import android.text.TextUtils
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -20,6 +21,7 @@ import com.digitalminds.comet.data.Playlist
 import com.digitalminds.comet.data.Song
 import com.digitalminds.comet.data.Video
 import com.digitalminds.comet.util.Format
+import com.digitalminds.comet.util.Highlight
 import com.digitalminds.comet.util.HistoryEntry
 import com.digitalminds.comet.util.PositionStore
 import com.digitalminds.comet.util.Thumbs
@@ -87,11 +89,11 @@ class SongVH(v: View) : RecyclerView.ViewHolder(v) {
         artBox.clipToOutline = true
     }
 
-    fun bind(s: Song, selection: Set<String>?) {
+    fun bind(s: Song, selection: Set<String>?, query: String = "") {
         val current = s.key == NowPlaying.key
-        title.text = s.title
+        title.text = Highlight.text(itemView.context, s.title, query)
         title.setTextColor(itemView.context.getColor(if (current) R.color.red_hot else R.color.white))
-        subtitle.text = "${s.subtitle}  ·  ${Format.duration(s.durationMs)}"
+        subtitle.text = TextUtils.concat(Highlight.text(itemView.context, s.subtitle, query), "  ·  ${Format.duration(s.durationMs)}")
         date.text = Format.shortDate(s.dateAdded)
         eq.visibility = if (current) View.VISIBLE else View.GONE
         eq.playing = current && NowPlaying.playing
@@ -115,13 +117,15 @@ class FolderVH(v: View) : RecyclerView.ViewHolder(v) {
     val icon: ImageView = v.findViewById(R.id.folderIcon)
     val cover: ImageView = v.findViewById(R.id.folderCover)
     val box: View = v.findViewById(R.id.folderIconBox)
+    val check: ImageView = v.findViewById(R.id.folderCheck)
 
     init {
         box.clipToOutline = true
     }
 
-    fun bind(name: String, count: Int, coverUri: Uri?) {
-        this.name.text = name
+    /** [selected] is null when not selecting; true / false shows the tick circle. */
+    fun bind(name: String, count: Int, coverUri: Uri?, selected: Boolean?, query: String = "") {
+        this.name.text = Highlight.text(itemView.context, name, query)
         this.count.text = count.toString()
         if (coverUri != null) {
             box.setBackgroundResource(R.drawable.bg_thumb_small)
@@ -132,6 +136,15 @@ class FolderVH(v: View) : RecyclerView.ViewHolder(v) {
             box.background = null
             icon.visibility = View.VISIBLE
             cover.visibility = View.GONE
+        }
+        if (selected == null) {
+            check.visibility = View.GONE
+            itemView.setBackgroundResource(R.drawable.bg_row)
+        } else {
+            check.visibility = View.VISIBLE
+            check.setBackgroundResource(if (selected) R.drawable.bg_check_on else R.drawable.bg_check_off)
+            check.setImageResource(if (selected) R.drawable.ic_check else 0)
+            itemView.setBackgroundResource(if (selected) R.drawable.bg_selected_row else R.drawable.bg_row)
         }
     }
 }
@@ -204,6 +217,9 @@ interface MainActions {
     fun onPlaylist(p: Playlist)
     fun onPlaylistMore(p: Playlist, anchor: View)
     fun onPhotoFolder(f: PhotoFolder)
+
+    /** Long press on a folder row: [key] is "v:", "m:" or "p:" plus the folder id. */
+    fun onFolderLong(key: String)
 }
 
 class MainAdapter(private val actions: MainActions) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
@@ -211,8 +227,11 @@ class MainAdapter(private val actions: MainActions) : RecyclerView.Adapter<Recyc
     var rows: List<MainRow> = emptyList()
         private set
 
-    /** Selected songs (by key) while in selection mode, else null. */
+    /** Selected songs or folders (by key) while in selection mode, else null. */
     var selection: MutableSet<String>? = null
+
+    /** Current search text, painted grey inside matching names. */
+    var query: String = ""
 
     fun submit(list: List<MainRow>) {
         rows = list
@@ -291,12 +310,14 @@ class MainAdapter(private val actions: MainActions) : RecyclerView.Adapter<Recyc
             }
             is MainRow.FolderRow -> {
                 val h = holder as FolderVH
-                h.bind(row.folder.name, row.folder.count, null)
+                val key = "v:" + row.folder.id
+                h.bind(row.folder.name, row.folder.count, null, selection?.contains(key))
                 h.itemView.setOnClickListener { actions.onVideoFolder(row.folder) }
+                h.itemView.setOnLongClickListener { actions.onFolderLong(key); true }
             }
             is MainRow.VideoRow -> {
                 val h = holder as VideoAdapter.VH
-                VideoAdapter.bind(h, row.video, null)
+                VideoAdapter.bind(h, row.video, null, query)
                 h.itemView.setOnClickListener { actions.onVideo(row.video) }
                 h.itemView.setOnLongClickListener(null)
             }
@@ -322,7 +343,7 @@ class MainAdapter(private val actions: MainActions) : RecyclerView.Adapter<Recyc
             }
             is MainRow.SongRow -> {
                 val h = holder as SongVH
-                h.bind(row.song, selection)
+                h.bind(row.song, selection, query)
                 h.itemView.setOnClickListener {
                     val p = h.bindingAdapterPosition
                     if (p != RecyclerView.NO_POSITION) actions.onSong(p)
@@ -335,8 +356,10 @@ class MainAdapter(private val actions: MainActions) : RecyclerView.Adapter<Recyc
             }
             is MainRow.MusicFolderRow -> {
                 val h = holder as FolderVH
-                h.bind(row.folder.name, row.folder.count, null)
+                val key = "m:" + row.folder.id
+                h.bind(row.folder.name, row.folder.count, null, selection?.contains(key))
                 h.itemView.setOnClickListener { actions.onMusicFolder(row.folder) }
+                h.itemView.setOnLongClickListener { actions.onFolderLong(key); true }
             }
             is MainRow.PlaylistRow -> {
                 val h = holder as PlaylistVH
@@ -346,8 +369,10 @@ class MainAdapter(private val actions: MainActions) : RecyclerView.Adapter<Recyc
             }
             is MainRow.PhotoFolderRow -> {
                 val h = holder as FolderVH
-                h.bind(row.folder.name, row.folder.count, row.folder.photos.firstOrNull()?.uri)
+                val key = "p:" + row.folder.id
+                h.bind(row.folder.name, row.folder.count, row.folder.photos.firstOrNull()?.uri, selection?.contains(key))
                 h.itemView.setOnClickListener { actions.onPhotoFolder(row.folder) }
+                h.itemView.setOnLongClickListener { actions.onFolderLong(key); true }
             }
         }
     }
@@ -363,6 +388,9 @@ class VideoAdapter(
     var items: List<Video> = emptyList()
         private set
     var grid = false
+
+    /** Current search text, painted grey inside matching names. */
+    var query: String = ""
 
     /** Keys of selected videos, or null when not in selection mode. */
     var selection: MutableSet<String>? = null
@@ -388,8 +416,8 @@ class VideoAdapter(
     }
 
     companion object {
-        fun bind(h: VH, v: Video, selection: Set<String>?) {
-            h.title.text = v.name
+        fun bind(h: VH, v: Video, selection: Set<String>?, query: String = "") {
+            h.title.text = Highlight.text(h.itemView.context, v.name, query)
             h.duration.text = Format.duration(v.durationMs)
             h.meta.text = Format.size(v.size)
             h.date.text = Format.shortDate(v.dateAdded)
@@ -418,7 +446,7 @@ class VideoAdapter(
     override fun getItemCount() = items.size
 
     override fun onBindViewHolder(h: VH, position: Int) {
-        bind(h, items[position], selection)
+        bind(h, items[position], selection, query)
         h.itemView.setOnClickListener {
             val p = h.bindingAdapterPosition
             if (p != RecyclerView.NO_POSITION) onClick(p)
@@ -441,6 +469,7 @@ class SongAdapter(
     var items: List<Song> = emptyList()
         private set
     var selection: MutableSet<String>? = null
+    var query: String = ""
 
     fun submit(list: List<Song>) {
         items = list
@@ -453,7 +482,7 @@ class SongAdapter(
     override fun getItemCount() = items.size
 
     override fun onBindViewHolder(h: SongVH, position: Int) {
-        h.bind(items[position], selection)
+        h.bind(items[position], selection, query)
         h.itemView.setOnClickListener {
             val p = h.bindingAdapterPosition
             if (p != RecyclerView.NO_POSITION) onClick(p)
@@ -495,7 +524,7 @@ class PhotoAdapter(
 
     override fun onBindViewHolder(h: VH, position: Int) {
         val p = items[position]
-        Thumbs.load(h.photo, p.uri, 256, 256)
+        Thumbs.load(h.photo, p.uri, 320, 320)
         val sel = selection
         if (sel == null) {
             h.check.visibility = View.GONE

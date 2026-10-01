@@ -16,6 +16,14 @@ object Format {
         else String.format(Locale.US, "%02d:%02d", m, s)
     }
 
+    /** "2 h 05 min" for totals that can be long. */
+    fun durationLong(ms: Long): String {
+        val totalMin = ms / 60_000
+        val h = totalMin / 60
+        val m = totalMin % 60
+        return if (h > 0) "$h h ${if (m < 10) "0$m" else "$m"} min" else "$m min"
+    }
+
     fun size(bytes: Long): String {
         if (bytes <= 0) return "0 B"
         val kb = bytes / 1024.0

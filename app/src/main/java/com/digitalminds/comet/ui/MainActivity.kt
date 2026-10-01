@@ -194,6 +194,7 @@ class MainActivity : AppCompatActivity(), MainActions {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
             override fun afterTextChanged(s: Editable?) {
                 query = s?.toString()?.trim() ?: ""
+                adapter.query = query
                 render()
             }
         })
@@ -203,6 +204,7 @@ class MainActivity : AppCompatActivity(), MainActions {
         getSystemService(InputMethodManager::class.java)?.hideSoftInputFromWindow(b.searchInput.windowToken, 0)
         b.searchInput.setText("")
         query = ""
+        adapter.query = ""
         b.searchBar.visibility = View.GONE
         b.header.visibility = View.VISIBLE
         render()
@@ -379,11 +381,15 @@ class MainActivity : AppCompatActivity(), MainActions {
 
     // ---------------------------------------------------------------- selection (songs)
 
+    /** What the current selection holds: songs, or folders of videos, music or photos. */
+    private fun selectionKind(): Char? = adapter.selection?.firstOrNull()?.let { if (it.length > 1 && it[1] == ':') it[0] else 's' }
+
     private fun setupSelection() {
         b.btnSelClose.setOnClickListener { exitSelection() }
         b.btnSelAll.setOnClickListener {
             val sel = adapter.selection ?: return@setOnClickListener
-            val keys = shownSongs.map { it.key }
+            val kind = selectionKind() ?: return@setOnClickListener
+            val keys = allKeys(kind)
             if (sel.containsAll(keys)) sel.clear() else sel.addAll(keys)
             if (sel.isEmpty()) exitSelection() else {
                 adapter.notifyDataSetChanged()
@@ -392,7 +398,59 @@ class MainActivity : AppCompatActivity(), MainActions {
         }
         b.btnSelDelete.setOnClickListener {
             val sel = adapter.selection ?: return@setOnClickListener
-            deleter.delete(songs.filter { sel.contains(it.key) }.map { it.uri }, "song")
+            when (selectionKind()) {
+                'v' -> deleter.delete(videos.filter { sel.contains("v:" + it.bucketId) }.map { it.uri }, "video")
+                'm' -> deleter.delete(songs.filter { sel.contains("m:" + it.bucketId) }.map { it.uri }, "song")
+                'p' -> deleter.delete(photos.filter { sel.contains("p:" + it.bucketId) }.map { it.uri }, "photo")
+                else -> deleter.delete(songs.filter { sel.contains(it.key) }.map { it.uri }, "song")
+            }
+        }
+        b.btnSelShare.setOnClickListener {
+            val sel = adapter.selection ?: return@setOnClickListener
+            SelectionTools.share(this, songs.filter { sel.contains(it.key) }.map { it.uri }, "audio/*")
+        }
+        b.btnSelInfo.setOnClickListener { showSelectionProperties() }
+    }
+
+    private fun allKeys(kind: Char): List<String> = when (kind) {
+        'v' -> adapter.rows.mapNotNull { (it as? MainRow.FolderRow)?.let { r -> "v:" + r.folder.id } }
+        'm' -> adapter.rows.mapNotNull { (it as? MainRow.MusicFolderRow)?.let { r -> "m:" + r.folder.id } }
+        'p' -> adapter.rows.mapNotNull { (it as? MainRow.PhotoFolderRow)?.let { r -> "p:" + r.folder.id } }
+        else -> shownSongs.map { it.key }
+    }
+
+    /** One Properties table for everything selected together. */
+    private fun showSelectionProperties() {
+        val sel = adapter.selection ?: return
+        when (selectionKind()) {
+            'v' -> {
+                val chosen = MediaRepo.folders(videos, prefs).filter { sel.contains("v:" + it.id) }
+                SelectionTools.summary(
+                    this, "video", chosen.map { it.name }, chosen.sumOf { it.count },
+                    chosen.sumOf { it.totalSize }, chosen.sumOf { f -> f.videos.sumOf { it.durationMs } }, true
+                )
+            }
+            'm' -> {
+                val chosen = AudioRepo.folders(songs, prefs).filter { sel.contains("m:" + it.id) }
+                SelectionTools.summary(
+                    this, "song", chosen.map { it.name }, chosen.sumOf { it.count },
+                    chosen.sumOf { f -> f.songs.sumOf { it.size } }, chosen.sumOf { f -> f.songs.sumOf { it.durationMs } }, true
+                )
+            }
+            'p' -> {
+                val chosen = PhotoRepo.folders(photos, prefs).filter { sel.contains("p:" + it.id) }
+                SelectionTools.summary(
+                    this, "photo", chosen.map { it.name }, chosen.sumOf { it.count },
+                    chosen.sumOf { f -> f.photos.sumOf { it.size } }, null, true
+                )
+            }
+            else -> {
+                val chosen = songs.filter { sel.contains(it.key) }
+                SelectionTools.summary(
+                    this, "song", chosen.map { it.title }, chosen.size,
+                    chosen.sumOf { it.size }, chosen.sumOf { it.durationMs }, false
+                )
+            }
         }
     }
 
@@ -406,10 +464,33 @@ class MainActivity : AppCompatActivity(), MainActions {
         val sel = adapter.selection
         b.selectionBar.visibility = if (sel == null) View.GONE else View.VISIBLE
         b.nav.visibility = if (sel == null) View.VISIBLE else View.GONE
-        if (sel != null) b.selCount.text = "${sel.size} selected"
+        if (sel != null) {
+            val folders = selectionKind().let { it == 'v' || it == 'm' || it == 'p' }
+            b.selCount.text = if (folders) "${sel.size} selected" else "${sel.size} selected"
+            b.btnSelShare.visibility = if (folders) View.GONE else View.VISIBLE
+        }
     }
 
     private fun songAt(position: Int): Song? = (adapter.rows.getOrNull(position) as? MainRow.SongRow)?.song
+
+    private fun startSelection(key: String) {
+        b.list.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        if (adapter.selection == null) adapter.selection = LinkedHashSet()
+        adapter.selection?.add(key)
+        adapter.notifyDataSetChanged()
+        updateSelectionBar()
+    }
+
+    /** Tap on a folder while selecting: tick it or untick it. Returns true when it was a selection tap. */
+    private fun toggleFolder(key: String): Boolean {
+        val sel = adapter.selection ?: return false
+        if (!sel.add(key)) sel.remove(key)
+        if (sel.isEmpty()) exitSelection() else {
+            adapter.notifyDataSetChanged()
+            updateSelectionBar()
+        }
+        return true
+    }
 
     // ---------------------------------------------------------------- MainActions
 
@@ -422,8 +503,9 @@ class MainActivity : AppCompatActivity(), MainActions {
         } else {
             val queue = AudioRepo.queueFor(applicationContext, e.uri, e.bucketId, prefs)
             if (queue == null) return gone(e)
-            Launch.pending = queue
-            startActivity(Intent(this, MusicPlayerActivity::class.java))
+            // Resume right where it was, in the little bar and the notification only:
+            // the full player does not open.
+            mini.play(queue.first, queue.second)
         }
     }
 
@@ -439,6 +521,7 @@ class MainActivity : AppCompatActivity(), MainActions {
     }
 
     override fun onVideoFolder(f: Folder) {
+        if (toggleFolder("v:" + f.id)) return
         startActivity(
             Intent(this, FolderActivity::class.java)
                 .putExtra(FolderActivity.EXTRA_BUCKET, f.id)
@@ -492,11 +575,15 @@ class MainActivity : AppCompatActivity(), MainActions {
 
     override fun onSongLong(position: Int) {
         val song = songAt(position) ?: return
-        b.list.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-        if (adapter.selection == null) adapter.selection = LinkedHashSet()
-        adapter.selection?.add(song.key)
-        adapter.notifyDataSetChanged()
-        updateSelectionBar()
+        if (adapter.selection != null && selectionKind() != 's') return
+        startSelection(song.key)
+    }
+
+    override fun onFolderLong(key: String) {
+        val kind = selectionKind()
+        // Do not mix folders with songs, or two kinds of folders, in the same selection.
+        if (adapter.selection != null && kind != key[0]) return
+        startSelection(key)
     }
 
     private fun playSongs(list: List<Song>, index: Int) {
@@ -505,6 +592,7 @@ class MainActivity : AppCompatActivity(), MainActions {
     }
 
     override fun onMusicFolder(f: MusicFolder) {
+        if (toggleFolder("m:" + f.id)) return
         startActivity(
             Intent(this, SongListActivity::class.java)
                 .putExtra(SongListActivity.EXTRA_FOLDER, f.id)
@@ -540,6 +628,7 @@ class MainActivity : AppCompatActivity(), MainActions {
     }
 
     override fun onPhotoFolder(f: PhotoFolder) {
+        if (toggleFolder("p:" + f.id)) return
         startActivity(
             Intent(this, PhotoFolderActivity::class.java)
                 .putExtra(PhotoFolderActivity.EXTRA_BUCKET, f.id)
